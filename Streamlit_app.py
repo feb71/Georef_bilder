@@ -1,4 +1,5 @@
-import os, glob, io, shutil
+
+import os, glob, shutil
 import streamlit as st
 import pandas as pd
 from PIL import Image
@@ -7,6 +8,7 @@ from pyproj import Transformer, CRS
 
 st.set_page_config(page_title="Foto-geotagging (NTM/UTM → EXIF WGS84)", layout="wide")
 
+# ---------- helpers ----------
 def deg_to_dms_rational(dd):
     sign = 1 if dd >= 0 else -1
     dd = abs(dd)
@@ -45,7 +47,10 @@ def write_exif(path_in, path_out, lat, lon, alt=None, direction=None):
     exif_bytes = piexif.dump(exif_dict)
     im.save(path_out, "jpeg", exif=exif_bytes)
 
-def pick_epsg_label():
+def pick_epsg_label(key_base: str, default_index: int = 0):
+    """
+    Keyed selectbox + optional custom text_input to avoid duplicate element IDs.
+    """
     presets = {
         "EUREF89 / UTM32 (EPSG:25832)": 25832,
         "EUREF89 / UTM33 (EPSG:25833)": 25833,
@@ -53,10 +58,18 @@ def pick_epsg_label():
         "WGS84 (EPSG:4326)": 4326,
         "Custom EPSG": None,
     }
-    label = st.selectbox("Velg standard EPSG (eller velg «Custom EPSG» og skriv inn under):",
-                         list(presets.keys()), index=0)
+    label = st.selectbox(
+        "Velg standard EPSG (eller velg «Custom EPSG» og skriv inn under):",
+        list(presets.keys()),
+        index=default_index,
+        key=f"{key_base}_selectbox",
+    )
     code = presets[label]
-    custom = st.text_input("Custom EPSG (kun tall, f.eks. 5118 for NTM18):", value="") if code is None else ""
+    custom = st.text_input(
+        "Custom EPSG (kun tall, f.eks. 5118 for NTM18):",
+        value="",
+        key=f"{key_base}_custom_epsg",
+    ) if code is None else ""
     epsg = None
     if code is not None:
         epsg = code
@@ -64,12 +77,13 @@ def pick_epsg_label():
         epsg = int(custom.strip())
     return epsg
 
-def ensure_epsg(name, default):
+def ensure_epsg(name: str, default: int, key_base: str):
     st.markdown(f"**{name}**")
-    epsg = pick_epsg_label()
+    epsg = pick_epsg_label(key_base=key_base)
     if epsg is None:
         st.info(f"Ingen EPSG valgt – bruker default {default}.")
         epsg = default
+    # Validate
     try:
         _ = CRS.from_epsg(epsg)
     except Exception:
@@ -89,30 +103,31 @@ def transform_xy_to_epsg(x, y, src_epsg, dst_epsg):
     X, Y = tr.transform(float(x), float(y))
     return X, Y
 
+# ---------- UI ----------
 st.title("Geotagging av bilder (NTM/UTM → EXIF WGS84)")
 
-mode = st.tabs(["Samme posisjon for en mappe", "CSV-mapping for mange bilder"])
+tab_mappe, tab_csv = st.tabs(["Samme posisjon for en mappe", "CSV-mapping for mange bilder"])
 
-with mode[0]:
+with tab_mappe:
     st.subheader("A) Sett samme posisjon på alle JPG i en mappe")
     col1, col2 = st.columns(2)
     with col1:
-        in_folder = st.text_input("Innmappesti (f.eks. D:\\prosjekt\\Bilder\\KUM_001)", "")
-        out_folder = st.text_input("Ut-mappe (skriv til kopier, ikke originaler)", "")
-        overwrite = st.checkbox("Overskriv originaler i inn-mappa (ikke anbefalt)", value=False)
+        in_folder = st.text_input("Innmappesti (f.eks. D:\\\\prosjekt\\\\Bilder\\\\KUM_001)", "", key="A_in_folder")
+        out_folder = st.text_input("Ut-mappe (skriv til kopier, ikke originaler)", "", key="A_out_folder")
+        overwrite = st.checkbox("Overskriv originaler i inn-mappa (ikke anbefalt)", value=False, key="A_overwrite")
     with col2:
-        epsg_in = ensure_epsg("Inn-CRS (NTM/UTM)", 25832)
-        epsg_out_doc = ensure_epsg("Dokumentasjons-CRS for CSV (f.eks. 25832/25833)", 25832)
+        epsg_in = ensure_epsg("Inn-CRS (NTM/UTM)", 25832, key_base="A_epsg_in")
+        epsg_out_doc = ensure_epsg("Dokumentasjons-CRS for CSV (f.eks. 25832/25833)", 25832, key_base="A_epsg_doc")
 
     col3, col4, col5 = st.columns(3)
     with col3:
-        x = st.text_input("X Øst (inn-CRS)", "")
-        y = st.text_input("Y Nord (inn-CRS)", "")
+        x = st.text_input("X Øst (inn-CRS)", "", key="A_x")
+        y = st.text_input("Y Nord (inn-CRS)", "", key="A_y")
     with col4:
-        alt = st.text_input("Høyde (valgfri, meter)", "")
-        direction = st.text_input("Retning (valgfri, grader 0–360)", "")
+        alt = st.text_input("Høyde (valgfri, meter)", "", key="A_alt")
+        direction = st.text_input("Retning (valgfri, grader 0–360)", "", key="A_dir")
     with col5:
-        run1 = st.button("Kjør geotag (mappe)")
+        run1 = st.button("Kjør geotag (mappe)", key="A_run")
 
     if run1:
         if not in_folder or not os.path.isdir(in_folder):
@@ -134,6 +149,7 @@ with mode[0]:
                     fname = os.path.basename(p)
                     dst = p if overwrite else os.path.join(out_folder, fname)
                     if (not overwrite) and (p != dst):
+                        os.makedirs(os.path.dirname(dst), exist_ok=True)
                         shutil.copy2(p, dst)
                     write_exif(dst, dst, lat, lon, alt if alt else None, direction if direction else None)
                     Xdoc, Ydoc = transform_xy_to_epsg(float(x), float(y), epsg_in, epsg_out_doc)
@@ -142,11 +158,11 @@ with mode[0]:
                 df = pd.DataFrame(rows)
                 st.success(f"Geotagget {len(df)} bilder.")
                 st.download_button("Last ned CSV med posisjoner", df.to_csv(index=False).encode("utf-8"),
-                                   "geotag_mappe.csv", "text/csv")
+                                   "geotag_mappe.csv", "text/csv", key="A_download")
             except Exception as e:
                 st.exception(e)
 
-with mode[1]:
+with tab_csv:
     st.subheader("B) CSV-mapping (ulike posisjoner)")
     st.markdown("""
     **CSV-format (ett av to):**
@@ -155,15 +171,16 @@ with mode[1]:
     """)
     col1, col2 = st.columns(2)
     with col1:
-        root = st.text_input("Root-mappe (inneholder undermapper/bilder)", "")
-        csv_file = st.file_uploader("Last opp mapping-CSV", type=["csv"])
-        out_root = st.text_input("Ut-root (skriv kopier)", "")
-        overwrite2 = st.checkbox("Overskriv originale filer", value=False)
+        root = st.text_input("Root-mappe (inneholder undermapper/bilder)", "", key="B_root")
+        csv_file = st.file_uploader("Last opp mapping-CSV", type=["csv"], key="B_csv")
+        out_root = st.text_input("Ut-root (skriv kopier)", "", key="B_out_root")
+        overwrite2 = st.checkbox("Overskriv originale filer", value=False, key="B_overwrite")
     with col2:
-        epsg_in2 = ensure_epsg("Inn-CRS (NTM/UTM)", 25832)
-        epsg_out_doc2 = ensure_epsg("Dokumentasjons-CRS (CSV)", 25832)
+        epsg_in2 = ensure_epsg("Inn-CRS (NTM/UTM)", 25832, key_base="B_epsg_in")
+        epsg_out_doc2 = ensure_epsg("Dokumentasjons-CRS (CSV)", 25832, key_base="B_epsg_doc")
 
-    run2 = st.button("Kjør geotag (CSV-mapping)")
+    run2 = st.button("Kjør geotag (CSV-mapping)", key="B_run")
+
     if run2:
         if not root or not os.path.isdir(root):
             st.error("Root-mappe finnes ikke.")
@@ -194,12 +211,14 @@ with mode[1]:
                                      f"X_{epsg_out_doc2}": Xdoc, f"Y_{epsg_out_doc2}": Ydoc,
                                      "alt": Alt, "dir": Dir})
 
+                # Folder-form
                 if {"folder","x","y"}.issubset(dfm.columns):
                     for _, r in dfm.dropna(subset=["folder","x","y"]).iterrows():
                         folder = os.path.join(root, str(r["folder"]))
                         jpgs = sorted(glob.glob(os.path.join(folder, "*.jpg")) + glob.glob(os.path.join(folder, "*.JPG")))
                         process_target(jpgs, float(r["x"]), float(r["y"]), r.get("alt", None), r.get("dir", None))
 
+                # File-form
                 if {"file","x","y"}.issubset(dfm.columns):
                     for _, r in dfm.dropna(subset=["file","x","y"]).iterrows():
                         fpath = os.path.join(root, str(r["file"]))
@@ -208,6 +227,10 @@ with mode[1]:
                 dfr = pd.DataFrame(rows)
                 st.success(f"Geotagget {len(dfr)} bilder.")
                 st.download_button("Last ned CSV med posisjoner", dfr.to_csv(index=False).encode("utf-8"),
-                                   "geotag_csv.csv", "text/csv")
+                                   "geotag_csv.csv", "text/csv", key="B_download")
             except Exception as e:
                 st.exception(e)
+
+st.markdown("---")
+st.caption("Merk: EXIF lagrer alltid WGS84 (lat/lon). Inn-koordinater i NTM/UTM transformeres automatisk. "
+           "Kjør én batch per sone (NTM/UTM) for å unngå blanding.")
