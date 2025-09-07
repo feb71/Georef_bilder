@@ -133,7 +133,6 @@ def sanitize_for_filename(s):
     return s or None
 
 def build_new_name(pattern, label, orig_name, E=None, N=None):
-    # pattern in {"keep", "label_orig", "label_only", "label_en"}
     base, ext = os.path.splitext(orig_name)
     safe_label = sanitize_for_filename(label)
     if pattern == "keep" or not safe_label:
@@ -417,7 +416,7 @@ with tab_csv:
                         if col_epsg and not pd.isna(row.get(col_epsg, None)):
                             try:
                                 return int(row[col_epsg])
-                            except:
+                            except Exception:
                                 return epsg_in2_default
                         return epsg_in2_default
 
@@ -429,7 +428,10 @@ with tab_csv:
                                 continue
                             fname = os.path.relpath(p, root)
                             newname = build_new_name(patt, label, os.path.basename(fname), E, N)
-                            dst = p if overwrite2 else os.path.join(out_root, os.path.relpath(os.path.dirname(p), root), newname) if out_root else p
+                            if out_root and not overwrite2:
+                                dst = os.path.join(out_root, os.path.relpath(os.path.dirname(p), root), newname)
+                            else:
+                                dst = p if overwrite2 else os.path.join(os.path.dirname(p), newname)
                             os.makedirs(os.path.dirname(dst), exist_ok=True)
                             if dst != p:
                                 dst = ensure_unique_path(dst)
@@ -476,6 +478,8 @@ with tab_csv:
                     st.success(f"Geotagget {len(dfr)} bilder.")
                     st.download_button("Last ned CSV med posisjoner", dfr.to_csv(index=False).encode("utf-8"),
                                        "geotag_csv_mapping.csv", "text/csv", key="B_csv_dl")
+        except Exception as e:
+            st.exception(e)
 
 st.markdown("---")
 st.caption("Filnavn-mønstre: behold originalt, «S_OBJID + originalt», «kun S_OBJID», «S_OBJID + avrundet E/N». "
