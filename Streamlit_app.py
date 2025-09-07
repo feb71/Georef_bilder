@@ -1,12 +1,12 @@
 
-import os, glob, shutil, io, zipfile, re
+import os, glob, shutil, io, zipfile, re, math
 import streamlit as st
 import pandas as pd
 from PIL import Image
 import piexif
 from pyproj import Transformer, CRS
 
-st.set_page_config(page_title="Geotagging bilder • Gemini-skjema (Øst/Nord/Høyde/Rotasjon/S_OBJID) → EXIF WGS84", layout="wide")
+st.set_page_config(page_title="Geotagging bilder • Gemini-skjema → EXIF WGS84 (med filnavn)", layout="wide")
 
 # ===== Helpers =====
 def deg_to_dms_rational(dd):
@@ -18,8 +18,20 @@ def deg_to_dms_rational(dd):
     s = round((m_full - m) * 60 * 10000)
     return sign, ((d,1),(m,1),(s,10000))
 
+def _is_valid_number(x):
+    try:
+        fx = float(x)
+    except Exception:
+        return False
+    return not (math.isnan(fx) or math.isinf(fx))
+
+def _wrap_deg(d):
+    d = float(d) % 360.0
+    if d < 0:
+        d += 360.0
+    return d
+
 def exif_gps(lat_dd, lon_dd, alt=None, direction=None):
-    import piexif
     sign_lat, lat = deg_to_dms_rational(lat_dd)
     sign_lon, lon = deg_to_dms_rational(lon_dd)
     gps = {
@@ -28,12 +40,12 @@ def exif_gps(lat_dd, lon_dd, alt=None, direction=None):
         piexif.GPSIFD.GPSLongitudeRef: b'E' if sign_lon>=0 else b'W',
         piexif.GPSIFD.GPSLongitude: lon,
     }
-    if alt is not None and str(alt) != "":
+    if _is_valid_number(alt):
         alt = float(alt)
         gps[piexif.GPSIFD.GPSAltitudeRef] = 0 if alt >= 0 else 1
         gps[piexif.GPSIFD.GPSAltitude] = (int(round(abs(alt)*100)), 100)
-    if direction is not None and str(direction) != "":
-        direction = float(direction)
+    if _is_valid_number(direction):
+        direction = _wrap_deg(direction)
         gps[piexif.GPSIFD.GPSImgDirectionRef] = b'T'  # true north
         gps[piexif.GPSIFD.GPSImgDirection] = (int(round(direction*100)), 100)
     return gps
@@ -57,7 +69,6 @@ def parse_float_maybe_comma(v):
     if s == "" or s.lower() in {"nan","none","-"}:
         return None
     if "," in s and "." in s:
-        # assume last sep is decimal
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "").replace(",", ".")
         else:
@@ -112,12 +123,47 @@ def list_subdirs(path):
     except Exception:
         return []
 
-# ===== UI =====
-st.title("Geotagging bilder – Gemini-skjema → EXIF (WGS84)")
+def sanitize_for_filename(s):
+    if s is None:
+        return None
+    s = str(s).strip()
+    s = re.sub(r'[\\/:*?"<>|]+', '_', s)  # remove illegal chars
+    s = re.sub(r'\s+', '_', s)           # spaces to underscore
+    s = s.strip('._')                    # avoid leading/trailing dots/underscores
+    return s or None
 
-st.info("**EXIF lagrer alltid WGS84 (lat/lon).** Denne appen er optimalisert for Excel/CSV med kolonner "
-        "«Øst», «Nord», «Høyde», «Rotasjon», «S_OBJID». «S_OBJID» brukes som punktnavn. "
-        "Velg inn-CRS (f.eks. EPSG:25832/33 eller NTM) og kjør.")
+def build_new_name(pattern, label, orig_name, E=None, N=None):
+    # pattern in {"keep", "label_orig", "label_only", "label_en"}
+    base, ext = os.path.splitext(orig_name)
+    safe_label = sanitize_for_filename(label)
+    if pattern == "keep" or not safe_label:
+        return orig_name
+    if pattern == "label_orig":
+        return f"{safe_label}_{base}{ext}"
+    if pattern == "label_only":
+        return f"{safe_label}{ext}"
+    if pattern == "label_en":
+        e_txt = f"{int(round(E))}" if E is not None else "E"
+        n_txt = f"{int(round(N))}" if N is not None else "N"
+        return f"{safe_label}_{e_txt}_{n_txt}{ext}"
+    return orig_name
+
+def ensure_unique_path(path):
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    i = 1
+    while True:
+        candidate = f"{base}_{i}{ext}"
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+# ===== UI =====
+st.title("Geotagging bilder – Gemini-skjema → EXIF (WGS84) + fornuftige filnavn")
+
+st.info("Bruker kolonnene «Øst», «Nord», «Høyde», «Rotasjon», «S_OBJID» hvis de finnes. "
+        "EXIF skrives alltid i WGS84. Velg inn-CRS for E/N og mønster for nytt filnavn.")
 
 tab_mappe, tab_csv = st.tabs(["Mappe/ZIP + ett punkt", "CSV/Excel-mapping for mange bilder"])
 
@@ -152,6 +198,13 @@ with tab_mappe:
             out_folder = None
             overwrite = False
 
+        rename_pattern = st.selectbox("Nytt filnavn (mønster)", [
+            "Behold originalt navn",
+            "S_OBJID + originalt navn",
+            "Kun S_OBJID",
+            "S_OBJID + avrundet E/N"
+        ], index=1, key="A_rename")
+
     with colA2:
         st.markdown("#### Velg punkt fra fil (Excel/CSV) – Gemini-skjema")
         pts_up = st.file_uploader("Punktliste (Øst, Nord, Høyde, Rotasjon, S_OBJID)", type=["xlsx","xls","csv"], key="A_pts")
@@ -171,7 +224,6 @@ with tab_mappe:
                 df = None
 
             if df is not None and not df.empty:
-                # Normalize header map (case-insensitive exact match for Gemini headers)
                 low = {c.lower(): c for c in df.columns}
                 col_e  = low.get("øst", low.get("oest", low.get("x", None)))
                 col_n  = low.get("nord", low.get("y", None))
@@ -182,17 +234,15 @@ with tab_mappe:
                 if not col_e or not col_n:
                     st.error("Fant ikke «Øst»/«Nord» i fila. Sjekk kolonnenavn.")
                 else:
-                    # vis tabell
                     show_cols = [c for c in [col_id, col_e, col_n, col_h, col_r] if c]
                     st.dataframe(df[show_cols].head(20))
 
-                    # velg punkt
                     idx = st.selectbox("Velg punkt:", df.index.tolist(),
                                        format_func=lambda i: f"{df.loc[i, col_id]}" if col_id else f"Rad {i+1}",
                                        key="A_pick")
                     def pf(v): return parse_float_maybe_comma(v)
-                    E  = pf(df.loc[idx, col_e])
-                    N  = pf(df.loc[idx, col_n])
+                    E   = pf(df.loc[idx, col_e])
+                    N   = pf(df.loc[idx, col_n])
                     Alt = pf(df.loc[idx, col_h]) if col_h else None
                     Dir = pf(df.loc[idx, col_r]) if col_r else None
                     label = df.loc[idx, col_id] if col_id else None
@@ -219,21 +269,36 @@ with tab_mappe:
                     out_dir = in_folder if overwrite or not out_folder else out_folder
                     if not overwrite and out_folder:
                         os.makedirs(out_folder, exist_ok=True)
+
+                    patt_map = {
+                        "Behold originalt navn": "keep",
+                        "S_OBJID + originalt navn": "label_orig",
+                        "Kun S_OBJID": "label_only",
+                        "S_OBJID + avrundet E/N": "label_en",
+                    }
+                    patt = patt_map[rename_pattern]
+
                     for p in jpgs:
                         fname = os.path.basename(p)
-                        dst = p if overwrite or not out_folder else os.path.join(out_folder, fname)
-                        if (not overwrite) and out_folder and (p != dst):
+                        newname = build_new_name(patt, label, fname, E, N)
+                        if not overwrite and out_folder:
+                            dst = ensure_unique_path(os.path.join(out_folder, newname))
                             shutil.copy2(p, dst)
+                        else:
+                            dst = os.path.join(os.path.dirname(p), newname) if newname != fname else p
+                            if dst != p:
+                                dst = ensure_unique_path(dst)
+                                shutil.copy2(p, dst)
                         write_exif(dst, dst, lat, lon, Alt, Dir)
                         Xdoc, Ydoc = transform_EN_to_epsg(float(E), float(N), epsg_in, epsg_out_doc)
-                        rows.append({"file": fname, "label": label, "E_in": E, "N_in": N, "lat": lat, "lon": lon,
+                        rows.append({"file": os.path.basename(dst), "label": label, "E_in": E, "N_in": N, "lat": lat, "lon": lon,
                                      f"E_{epsg_out_doc}": Xdoc, f"N_{epsg_out_doc}": Ydoc, "hoyde": Alt, "rotasjon": Dir})
                     df_out = pd.DataFrame(rows)
                     st.success(f"Geotagget {len(df_out)} bilder i: {out_dir}")
                     st.download_button("Last ned CSV med posisjoner", df_out.to_csv(index=False).encode("utf-8"),
                                        "geotag_mappe.csv", "text/csv", key="A_csv")
 
-            else:  # ZIP upload
+            else:
                 if zip_up is None:
                     st.error("Last opp en ZIP med bilder.")
                 else:
@@ -244,8 +309,18 @@ with tab_mappe:
                     zout_mem = io.BytesIO()
                     zout = zipfile.ZipFile(zout_mem, "w", zipfile.ZIP_DEFLATED)
 
+                    patt_map = {
+                        "Behold originalt navn": "keep",
+                        "S_OBJID + originalt navn": "label_orig",
+                        "Kun S_OBJID": "label_only",
+                        "S_OBJID + avrundet E/N": "label_en",
+                    }
+                    patt = patt_map[rename_pattern]
+
                     tempdir = "tmp_zip_in"
                     os.makedirs(tempdir, exist_ok=True)
+                    used_names = set()
+
                     for name in zin.namelist():
                         if not name.lower().endswith((".jpg", ".jpeg")):
                             continue
@@ -253,11 +328,23 @@ with tab_mappe:
                         tmp_path = os.path.join(tempdir, os.path.basename(name))
                         with open(tmp_path, "wb") as f:
                             f.write(src_bytes)
+
                         write_exif(tmp_path, tmp_path, lat, lon, Alt, Dir)
+
+                        newname = build_new_name(patt, label, os.path.basename(name), E, N)
+                        base, ext = os.path.splitext(newname)
+                        candidate = newname
+                        i = 1
+                        while candidate in used_names:
+                            candidate = f"{base}_{i}{ext}"
+                            i += 1
+                        used_names.add(candidate)
+
                         with open(tmp_path, "rb") as f:
-                            zout.writestr(name, f.read())
+                            zout.writestr(candidate, f.read())
+
                         Xdoc, Ydoc = transform_EN_to_epsg(float(E), float(N), epsg_in, epsg_out_doc)
-                        rows.append({"file": name, "label": label, "E_in": E, "N_in": N, "lat": lat, "lon": lon,
+                        rows.append({"file": candidate, "label": label, "E_in": E, "N_in": N, "lat": lat, "lon": lon,
                                      f"E_{epsg_out_doc}": Xdoc, f"N_{epsg_out_doc}": Ydoc, "hoyde": Alt, "rotasjon": Dir})
                     zin.close(); zout.close()
                     df_out = pd.DataFrame(rows)
@@ -273,8 +360,7 @@ with tab_mappe:
 with tab_csv:
     st.subheader("B) CSV/Excel-mapping (lokal disk) – Gemini-skjema")
     st.markdown("Format: minst kolonnene **Øst, Nord**. Valgfritt **Høyde, Rotasjon, S_OBJID**. "
-                "Du velger root-mappe lokalt; appen setter EXIF på alle JPG i hver mappes rad (folder-form) "
-                "eller på hver enkelt fil (file-form).")
+                "Velg også hvordan filene skal navngis.")
 
     colB1, colB2 = st.columns(2)
     with colB1:
@@ -285,6 +371,12 @@ with tab_csv:
     with colB2:
         epsg_in2_default = ensure_epsg("Inn-CRS standard (brukes hvis rad mangler epsg)", key_base="B_epsg_in", default=25832)
         epsg_out_doc2 = ensure_epsg("Dokumentasjons-CRS for CSV (kun eksport)", key_base="B_epsg_doc", default=25832)
+        rename_pattern_B = st.selectbox("Nytt filnavn (mønster)", [
+            "Behold originalt navn",
+            "S_OBJID + originalt navn",
+            "Kun S_OBJID",
+            "S_OBJID + avrundet E/N"
+        ], index=1, key="B_rename")
 
     runB = st.button("Kjør geotag (CSV/Excel)", key="B_run")
     if runB:
@@ -312,7 +404,14 @@ with tab_csv:
                     st.error("Fant ikke «Øst»/«Nord» i fila.")
                 else:
                     rows = []
-                    os.makedirs(out_root, exist_ok=True) if (out_root and not overwrite2) else None
+
+                    patt_map = {
+                        "Behold originalt navn": "keep",
+                        "S_OBJID + originalt navn": "label_orig",
+                        "Kun S_OBJID": "label_only",
+                        "S_OBJID + avrundet E/N": "label_en",
+                    }
+                    patt = patt_map[rename_pattern_B]
 
                     def row_epsg(row):
                         if col_epsg and not pd.isna(row.get(col_epsg, None)):
@@ -329,13 +428,16 @@ with tab_csv:
                                 st.warning(f"Mangler fil: {p}")
                                 continue
                             fname = os.path.relpath(p, root)
-                            dst = p if overwrite2 else os.path.join(out_root, fname) if out_root else p
+                            newname = build_new_name(patt, label, os.path.basename(fname), E, N)
+                            dst = p if overwrite2 else os.path.join(out_root, os.path.relpath(os.path.dirname(p), root), newname) if out_root else p
                             os.makedirs(os.path.dirname(dst), exist_ok=True)
-                            if (not overwrite2) and (p != dst):
+                            if dst != p:
+                                dst = ensure_unique_path(dst)
                                 shutil.copy2(p, dst)
                             write_exif(dst, dst, lat, lon, Alt, Dir)
                             Xdoc, Ydoc = transform_EN_to_epsg(E, N, epsg_row, epsg_out_doc2)
-                            rows.append({"file": fname, "label": label, "E_in": E, "N_in": N, "epsg_in": epsg_row,
+                            rows.append({"file": os.path.relpath(dst, out_root) if out_root else os.path.basename(dst),
+                                         "label": label, "E_in": E, "N_in": N, "epsg_in": epsg_row,
                                          "lat": lat, "lon": lon, f"E_{epsg_out_doc2}": Xdoc, f"N_{epsg_out_doc2}": Ydoc,
                                          "hoyde": Alt, "rotasjon": Dir})
 
@@ -374,10 +476,7 @@ with tab_csv:
                     st.success(f"Geotagget {len(dfr)} bilder.")
                     st.download_button("Last ned CSV med posisjoner", dfr.to_csv(index=False).encode("utf-8"),
                                        "geotag_csv_mapping.csv", "text/csv", key="B_csv_dl")
-        except Exception as e:
-            st.exception(e)
 
 st.markdown("---")
-st.caption("Kolonner: Øst=Easting, Nord=Northing, Høyde i meter, Rotasjon i grader (0–360, sann nord). "
-           "S_OBJID brukes som punktnavn. EXIF skrives alltid i WGS84. "
-           "Velg korrekt inn-CRS (typisk EPSG:25832/25833 eller NTM-sone).")
+st.caption("Filnavn-mønstre: behold originalt, «S_OBJID + originalt», «kun S_OBJID», «S_OBJID + avrundet E/N». "
+           "Ugyldige tegn i filnavn erstattes automatisk. Ved navnekonflikt legges _1, _2, ... til.")
